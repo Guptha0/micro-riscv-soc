@@ -236,7 +236,17 @@ module alu_tb;
         run_test(MIN_NEG, 32'd1, ALU_SUB, MAX_POS, 1'b0, 1'b1, "SUB_Neg_Overflow");
         run_test(MIN_NEG, MAX_POS, ALU_SUB, 32'd1, 1'b0, 1'b1, "SUB_Extreme_Neg_Pos");
         run_test(32'hDEAD_BEEF, 32'd0, ALU_SUB, 32'hDEAD_BEEF, 1'b0, 1'b0, "SUB_Minus_Zero");
-        run_test(32'd10, 32'd10, 4'b0001, 32'd0, 1'b1, 1'b0, "SUB_Alias_Opcode_0001");
+
+        //======================================================================
+        // SUITE 2B: SHIFT & LOGICAL OPERATIONS (SLL, SLTU, XOR, SRL, SRA)
+        //======================================================================
+        $display("\n--- SUITE 2B: Shift & Logical RV32I Operations ---");
+        run_test(32'd1, 32'd4, 4'b0001, 32'd16, 1'b0, 1'b0, "SLL_1_Shift_4");
+        run_test(32'd10, 32'd20, 4'b0011, 32'd1, 1'b0, 1'b0, "SLTU_10_Less_20");
+        run_test(32'd20, 32'd10, 4'b0011, 32'd0, 1'b1, 1'b0, "SLTU_20_NotLess_10");
+        run_test(32'hFF00_FF00, 32'h0F0F_0F0F, 4'b0100, 32'hF00F_F00F, 1'b0, 1'b0, "XOR_Pattern");
+        run_test(32'h8000_0000, 32'd4, 4'b0101, 32'h0800_0000, 1'b0, 1'b0, "SRL_Logical_Shift");
+        run_test(32'h8000_0000, 32'd4, 4'b1101, 32'hF800_0000, 1'b0, 1'b0, "SRA_Arithmetic_Shift");
 
         //======================================================================
         // SUITE 3: AND OPERATIONS

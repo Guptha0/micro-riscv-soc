@@ -1,20 +1,23 @@
 //==============================================================================
 // Module Name: pipeline_cpu
 // Description: Advanced 5-Stage Pipelined 32-bit RISC-V Processor Core
-//              supporting RV32IM + RV32A + Dynamic Branch Prediction + HPM CSRs.
+//              supporting RV32IMZicsr_Zalrsc + Dynamic Branch Prediction + HPM CSRs.
 //
 // Pipeline Stages:
 //   1. IF  : Instruction Fetch (PC, I-Cache, 64-entry BTB/BHT Branch Predictor)
 //   2. ID  : Instruction Decode & Register Fetch (imm_gen, regfile, hazard unit)
-//   3. EX  : Execute & Address Calculation (ALU, M-Ext, Forwarding, CSRs)
-//   4. MEM : Memory Access, D-Cache, & RV32A Atomic Reservation Controller
-//   5. WB  : Write-Back to Register File
+//   3. EX  : Execute & Address Calculation (ALU, M-Ext, Forwarding, CSRs, Traps)
+//   4. MEM : Memory Access, D-Cache, Byte Masking & RV32A Atomic Reservation Controller
+//   5. WB  : Write-Back to Register File (formatted sub-word loads)
 //
-// Bleeding-Edge Upgrades:
-//   - Dynamic Branch Prediction with 64-entry BTB and 2-bit Saturating BHT
-//   - Speculative instruction fetching with zero-penalty branch hits
+// Architectural Features:
+//   - Complete RV32I Base Integer Instruction Set (Shifts, Compares, Sub-word Load/Store)
+//   - RV32M Hardware Multiplier and Hardware Restoring Divider
 //   - RV32A Atomic Memory Extension (LR.W / SC.W) with bus-snooping invalidation
-//   - Privileged Architecture HPM Telemetry Counters (mcycle, minstret, hpm3/4)
+//   - Dynamic Branch Prediction with 64-entry BTB and 2-bit Saturating BHT
+//   - Privileged Architecture HPM Telemetry Counters (mcycle, minstret, mhpmcounter3/4)
+//   - Privileged M-Mode Trap & Exception Controller (timer interrupt, ecall, ebreak, illegal)
+//   - Robust Pipeline Valid Bits preventing bubble overcounting
 //==============================================================================
 
 `timescale 1ns / 1ps
@@ -32,6 +35,7 @@ module pipeline_cpu (
     // Data Memory / MMIO Bus Interface (MEM stage)
     output wire [31:0] dmem_addr,
     output wire [31:0] dmem_wdata,
+    output wire [3:0]  dmem_wstrb,
     output wire        dmem_we,
     output wire        dmem_re,
     input  wire [31:0] dmem_rdata,
@@ -84,11 +88,16 @@ module pipeline_cpu (
     localparam [6:0] OPCODE_SYSTEM = 7'b1110011; // 7'h73 (CSR / Privileged)
 
     // ALU operation encodings matching alu.v
-    localparam [3:0] ALU_ADD = 4'b0000;
-    localparam [3:0] ALU_SUB = 4'b1000;
-    localparam [3:0] ALU_SLT = 4'b0010;
-    localparam [3:0] ALU_OR  = 4'b0110;
-    localparam [3:0] ALU_AND = 4'b0111;
+    localparam [3:0] ALU_ADD  = 4'b0000;
+    localparam [3:0] ALU_SUB  = 4'b1000;
+    localparam [3:0] ALU_SLL  = 4'b0001;
+    localparam [3:0] ALU_SLT  = 4'b0010;
+    localparam [3:0] ALU_SLTU = 4'b0011;
+    localparam [3:0] ALU_XOR  = 4'b0100;
+    localparam [3:0] ALU_SRL  = 4'b0101;
+    localparam [3:0] ALU_SRA  = 4'b1101;
+    localparam [3:0] ALU_OR   = 4'b0110;
+    localparam [3:0] ALU_AND  = 4'b0111;
 
     // Write-back source selection (3-bit)
     localparam [2:0] WB_ALU = 3'b000;
@@ -164,11 +173,12 @@ module pipeline_cpu (
         end
     end
 
-    // IF/ID Pipeline Register (Carrying Speculative Prediction Data)
+    // IF/ID Pipeline Register (Carrying Speculative Prediction Data & Valid Bit)
     reg [31:0] if_id_pc;
     reg [31:0] if_id_instruction;
     reg        if_id_pred_taken;
     reg [31:0] if_id_pred_target;
+    reg        if_id_valid;
 
     wire flush_if_id = branch_mispredict_ex || take_trap || ex_is_mret;
 
@@ -178,11 +188,13 @@ module pipeline_cpu (
             if_id_instruction <= 32'h0000_0013; // NOP
             if_id_pred_taken  <= 1'b0;
             if_id_pred_target <= 32'h0000_0000;
+            if_id_valid       <= 1'b0;
         end else if (flush_if_id) begin
             if_id_pc          <= 32'h0000_0000;
             if_id_instruction <= 32'h0000_0013; // Flush with NOP
             if_id_pred_taken  <= 1'b0;
             if_id_pred_target <= 32'h0000_0000;
+            if_id_valid       <= 1'b0;
         end else if (dcache_stall || stall_m_ext) begin
             // Hold IF/ID frozen when downstream stages are stalled
         end else if (icache_stall) begin
@@ -191,11 +203,13 @@ module pipeline_cpu (
             if_id_instruction <= 32'h0000_0013;
             if_id_pred_taken  <= 1'b0;
             if_id_pred_target <= 32'h0000_0000;
+            if_id_valid       <= 1'b0; // Bubble has valid = 0!
         end else if (!load_use_hazard) begin
             if_id_pc          <= if_pc;
             if_id_instruction <= icache_instruction;
             if_id_pred_taken  <= pred_taken;
             if_id_pred_target <= pred_target;
+            if_id_valid       <= 1'b1;
         end
     end
 
@@ -235,14 +249,15 @@ module pipeline_cpu (
     wire [31:0] wb_write_data;
     reg  [4:0]  mem_wb_rd;
     reg         mem_wb_reg_write;
-    reg  [31:0] mem_wb_pc;
+    reg         mem_wb_valid;
+    wire        regfile_we = mem_wb_valid && mem_wb_reg_write && (mem_wb_rd != 5'd0);
 
     regfile #(
         .WRITE_FIRST(1) // Transparent forwarding for ID/WB collisions
     ) u_regfile (
         .clk          (clk),
         .rst_n        (rst_n),
-        .write_enable (mem_wb_reg_write),
+        .write_enable (regfile_we),
         .rs1          (id_rs1),
         .rs2          (id_rs2),
         .rd           (mem_wb_rd),
@@ -250,6 +265,25 @@ module pipeline_cpu (
         .rs1_data     (id_rs1_data),
         .rs2_data     (id_rs2_data)
     );
+
+    // Opcode Legality Check
+    wire id_valid_opcode = (id_opcode == OPCODE_R_TYPE) ||
+                           (id_opcode == OPCODE_I_TYPE) ||
+                           (id_opcode == OPCODE_LOAD)   ||
+                           (id_opcode == OPCODE_STORE)  ||
+                           (id_opcode == OPCODE_BRANCH) ||
+                           (id_opcode == OPCODE_JAL)    ||
+                           (id_opcode == OPCODE_JALR)   ||
+                           (id_opcode == OPCODE_LUI)    ||
+                           (id_opcode == OPCODE_AUIPC)  ||
+                           (id_opcode == OPCODE_AMO)    ||
+                           (id_opcode == OPCODE_SYSTEM);
+
+    // Synchronous Exception Detection in ID
+    wire id_is_ecall   = if_id_valid && (id_opcode == OPCODE_SYSTEM) && (if_id_instruction[31:20] == 12'h000) && (id_funct3 == 3'b000);
+    wire id_is_ebreak  = if_id_valid && (id_opcode == OPCODE_SYSTEM) && (if_id_instruction[31:20] == 12'h001) && (id_funct3 == 3'b000);
+    wire id_is_mret_op = if_id_valid && (id_opcode == OPCODE_SYSTEM) && (if_id_instruction[31:20] == 12'h302) && (id_funct3 == 3'b000);
+    wire id_is_illegal = if_id_valid && !id_valid_opcode;
 
     // Control Unit Decoder
     reg        id_reg_write;
@@ -283,153 +317,164 @@ module pipeline_cpu (
         id_is_csr        = 1'b0;
         id_is_mret       = 1'b0;
 
-        case (id_opcode)
-            OPCODE_R_TYPE: begin
-                id_reg_write     = 1'b1;
-                id_alu_src_a_sel = 1'b0;
-                id_alu_src_b_sel = 1'b0;
-                id_wb_sel        = WB_ALU;
-                case (id_funct3)
-                    3'b000:  id_alu_ctrl = id_funct7[5] ? ALU_SUB : ALU_ADD;
-                    3'b010:  id_alu_ctrl = ALU_SLT;
-                    3'b110:  id_alu_ctrl = ALU_OR;
-                    3'b111:  id_alu_ctrl = ALU_AND;
-                    default: id_alu_ctrl = ALU_ADD;
-                endcase
-            end
-
-            OPCODE_I_TYPE: begin
-                id_reg_write     = 1'b1;
-                id_alu_src_a_sel = 1'b0;
-                id_alu_src_b_sel = 1'b1;
-                id_wb_sel        = WB_ALU;
-                case (id_funct3)
-                    3'b000:  id_alu_ctrl = ALU_ADD;
-                    3'b010:  id_alu_ctrl = ALU_SLT;
-                    3'b110:  id_alu_ctrl = ALU_OR;
-                    3'b111:  id_alu_ctrl = ALU_AND;
-                    default: id_alu_ctrl = ALU_ADD;
-                endcase
-            end
-
-            OPCODE_LOAD: begin
-                id_reg_write     = 1'b1;
-                id_mem_read      = 1'b1;
-                id_alu_src_a_sel = 1'b0;
-                id_alu_src_b_sel = 1'b1;
-                id_alu_ctrl      = ALU_ADD;
-                id_wb_sel        = WB_MEM;
-            end
-
-            OPCODE_STORE: begin
-                id_mem_write     = 1'b1;
-                id_alu_src_a_sel = 1'b0;
-                id_alu_src_b_sel = 1'b1;
-                id_alu_ctrl      = ALU_ADD;
-            end
-
-            OPCODE_BRANCH: begin
-                id_is_branch     = 1'b1;
-                id_alu_src_a_sel = 1'b0;
-                id_alu_src_b_sel = 1'b0;
-                id_alu_ctrl      = ALU_SUB;
-            end
-
-            OPCODE_JAL: begin
-                id_reg_write     = 1'b1;
-                id_is_jal        = 1'b1;
-                id_alu_src_a_sel = 1'b1; // pc
-                id_alu_src_b_sel = 1'b1; // imm
-                id_alu_ctrl      = ALU_ADD;
-                id_wb_sel        = WB_PC4;
-            end
-
-            OPCODE_JALR: begin
-                id_reg_write     = 1'b1;
-                id_is_jalr       = 1'b1;
-                id_alu_src_a_sel = 1'b0; // rs1
-                id_alu_src_b_sel = 1'b1; // imm
-                id_alu_ctrl      = ALU_ADD;
-                id_wb_sel        = WB_PC4;
-            end
-
-            OPCODE_LUI: begin
-                id_reg_write     = 1'b1;
-                id_alu_src_a_sel = 1'b0; // 0
-                id_alu_src_b_sel = 1'b1; // imm
-                id_alu_ctrl      = ALU_ADD;
-                id_wb_sel        = WB_ALU;
-            end
-
-            OPCODE_AUIPC: begin
-                id_reg_write     = 1'b1;
-                id_alu_src_a_sel = 1'b1; // pc
-                id_alu_src_b_sel = 1'b1; // imm
-                id_alu_ctrl      = ALU_ADD;
-                id_wb_sel        = WB_ALU;
-            end
-
-            OPCODE_AMO: begin
-                // RV32A Atomic Instructions (LR.W, SC.W)
-                if (id_funct3 == 3'b010) begin
-                    case (id_funct7[6:2])
-                        5'b00010: begin // LR.W
-                            id_is_lr         = 1'b1;
-                            id_reg_write     = 1'b1;
-                            id_mem_read      = 1'b1;
-                            id_alu_src_a_sel = 1'b0;
-                            id_alu_src_b_sel = 1'b0; // offset is 0
-                            id_alu_ctrl      = ALU_ADD;
-                            id_wb_sel        = WB_MEM;
-                        end
-                        5'b00011: begin // SC.W
-                            id_is_sc         = 1'b1;
-                            id_reg_write     = 1'b1;
-                            id_mem_write     = 1'b1;
-                            id_alu_src_a_sel = 1'b0;
-                            id_alu_src_b_sel = 1'b0;
-                            id_alu_ctrl      = ALU_ADD;
-                            id_wb_sel        = WB_SC; // writes sc_result (0/1) to rd
-                        end
-                        default: ;
-                    endcase
-                end
-            end
-
-            OPCODE_SYSTEM: begin
-                // Privileged CSR Operations (CSRRW, CSRRS, CSRRC, etc.)
-                if (id_funct3 != 3'b000) begin
-                    id_is_csr        = 1'b1;
-                    id_reg_write     = 1'b1;
+        if (if_id_valid) begin
+            case (id_opcode)
+                OPCODE_R_TYPE: begin
+                    id_reg_write     = (id_rd != 5'd0);
                     id_alu_src_a_sel = 1'b0;
                     id_alu_src_b_sel = 1'b0;
-                    id_alu_ctrl      = ALU_ADD;
-                    id_wb_sel        = WB_CSR; // writes previous CSR value to rd
-                end else if (if_id_instruction[31:20] == 12'h302) begin
-                    // MRET (Machine-Mode Return from Trap)
-                    id_is_mret       = 1'b1;
-                    id_reg_write     = 1'b0;
+                    id_wb_sel        = WB_ALU;
+                    case (id_funct3)
+                        3'b000:  id_alu_ctrl = id_funct7[5] ? ALU_SUB : ALU_ADD;
+                        3'b001:  id_alu_ctrl = ALU_SLL;
+                        3'b010:  id_alu_ctrl = ALU_SLT;
+                        3'b011:  id_alu_ctrl = ALU_SLTU;
+                        3'b100:  id_alu_ctrl = ALU_XOR;
+                        3'b101:  id_alu_ctrl = id_funct7[5] ? ALU_SRA : ALU_SRL;
+                        3'b110:  id_alu_ctrl = ALU_OR;
+                        3'b111:  id_alu_ctrl = ALU_AND;
+                        default: id_alu_ctrl = ALU_ADD;
+                    endcase
                 end
-            end
 
-            default: begin
-                id_reg_write     = 1'b0;
-                id_alu_ctrl      = ALU_ADD;
-                id_wb_sel        = WB_ALU;
-            end
-        endcase
+                OPCODE_I_TYPE: begin
+                    id_reg_write     = (id_rd != 5'd0);
+                    id_alu_src_a_sel = 1'b0;
+                    id_alu_src_b_sel = 1'b1;
+                    id_wb_sel        = WB_ALU;
+                    case (id_funct3)
+                        3'b000:  id_alu_ctrl = ALU_ADD;
+                        3'b001:  id_alu_ctrl = ALU_SLL;                          // SLLI
+                        3'b010:  id_alu_ctrl = ALU_SLT;                          // SLTI
+                        3'b011:  id_alu_ctrl = ALU_SLTU;                         // SLTIU
+                        3'b100:  id_alu_ctrl = ALU_XOR;                          // XORI
+                        3'b101:  id_alu_ctrl = id_funct7[5] ? ALU_SRA : ALU_SRL; // SRAI / SRLI
+                        3'b110:  id_alu_ctrl = ALU_OR;                           // ORI
+                        3'b111:  id_alu_ctrl = ALU_AND;                          // ANDI
+                        default: id_alu_ctrl = ALU_ADD;
+                    endcase
+                end
+
+                OPCODE_LOAD: begin
+                    id_reg_write     = (id_rd != 5'd0);
+                    id_mem_read      = 1'b1;
+                    id_alu_src_a_sel = 1'b0;
+                    id_alu_src_b_sel = 1'b1;
+                    id_alu_ctrl      = ALU_ADD;
+                    id_wb_sel        = WB_MEM;
+                end
+
+                OPCODE_STORE: begin
+                    id_mem_write     = 1'b1;
+                    id_alu_src_a_sel = 1'b0;
+                    id_alu_src_b_sel = 1'b1;
+                    id_alu_ctrl      = ALU_ADD;
+                end
+
+                OPCODE_BRANCH: begin
+                    id_is_branch     = 1'b1;
+                    id_alu_src_a_sel = 1'b0;
+                    id_alu_src_b_sel = 1'b0;
+                    id_alu_ctrl      = ALU_SUB;
+                end
+
+                OPCODE_JAL: begin
+                    id_reg_write     = (id_rd != 5'd0);
+                    id_is_jal        = 1'b1;
+                    id_alu_src_a_sel = 1'b1; // pc
+                    id_alu_src_b_sel = 1'b1; // imm
+                    id_alu_ctrl      = ALU_ADD;
+                    id_wb_sel        = WB_PC4;
+                end
+
+                OPCODE_JALR: begin
+                    id_reg_write     = (id_rd != 5'd0);
+                    id_is_jalr       = 1'b1;
+                    id_alu_src_a_sel = 1'b0; // rs1
+                    id_alu_src_b_sel = 1'b1; // imm
+                    id_alu_ctrl      = ALU_ADD;
+                    id_wb_sel        = WB_PC4;
+                end
+
+                OPCODE_LUI: begin
+                    id_reg_write     = (id_rd != 5'd0);
+                    id_alu_src_a_sel = 1'b0; // 0
+                    id_alu_src_b_sel = 1'b1; // imm
+                    id_alu_ctrl      = ALU_ADD;
+                    id_wb_sel        = WB_ALU;
+                end
+
+                OPCODE_AUIPC: begin
+                    id_reg_write     = (id_rd != 5'd0);
+                    id_alu_src_a_sel = 1'b1; // pc
+                    id_alu_src_b_sel = 1'b1; // imm
+                    id_alu_ctrl      = ALU_ADD;
+                    id_wb_sel        = WB_ALU;
+                end
+
+                OPCODE_AMO: begin
+                    // RV32A Atomic Instructions (LR.W, SC.W)
+                    if (id_funct3 == 3'b010) begin
+                        case (id_funct7[6:2])
+                            5'b00010: begin // LR.W
+                                id_is_lr         = 1'b1;
+                                id_reg_write     = (id_rd != 5'd0);
+                                id_mem_read      = 1'b1;
+                                id_alu_src_a_sel = 1'b0;
+                                id_alu_src_b_sel = 1'b0; // offset is 0
+                                id_alu_ctrl      = ALU_ADD;
+                                id_wb_sel        = WB_MEM;
+                            end
+                            5'b00011: begin // SC.W
+                                id_is_sc         = 1'b1;
+                                id_reg_write     = (id_rd != 5'd0);
+                                id_mem_write     = 1'b1;
+                                id_alu_src_a_sel = 1'b0;
+                                id_alu_src_b_sel = 1'b0;
+                                id_alu_ctrl      = ALU_ADD;
+                                id_wb_sel        = WB_SC; // writes sc_result (0/1) to rd
+                            end
+                            default: ;
+                        endcase
+                    end
+                end
+
+                OPCODE_SYSTEM: begin
+                    // Privileged CSR Operations (CSRRW, CSRRS, CSRRC, etc.)
+                    if (id_funct3 != 3'b000) begin
+                        id_is_csr        = 1'b1;
+                        id_reg_write     = (id_rd != 5'd0);
+                        id_alu_src_a_sel = 1'b0;
+                        id_alu_src_b_sel = 1'b0;
+                        id_alu_ctrl      = ALU_ADD;
+                        id_wb_sel        = WB_CSR; // writes previous CSR value to rd
+                    end else if (id_is_mret_op) begin
+                        // MRET (Machine-Mode Return from Trap)
+                        id_is_mret       = 1'b1;
+                        id_reg_write     = 1'b0;
+                    end
+                end
+
+                default: begin
+                    id_reg_write     = 1'b0;
+                    id_alu_ctrl      = ALU_ADD;
+                    id_wb_sel        = WB_ALU;
+                end
+            endcase
+        end
     end
 
     // RV32M Extension Detection
-    wire id_is_m_ext = (id_opcode == OPCODE_R_TYPE) && (id_funct7 == 7'b0000001);
+    wire id_is_m_ext = if_id_valid && (id_opcode == OPCODE_R_TYPE) && (id_funct7 == 7'b0000001);
     wire id_is_mul   = id_is_m_ext && (!id_funct3[2]); // MUL, MULH, MULHSU, MULHU
     wire id_is_div   = id_is_m_ext && (id_funct3[2]);  // DIV, DIVU, REM, REMU
 
     // Load-Use Hazard Detection Unit
     reg [4:0] id_ex_rd;
     reg       id_ex_mem_read;
+    reg       id_ex_valid;
 
-    assign load_use_hazard = id_ex_mem_read && (id_ex_rd != 5'd0) &&
+    assign load_use_hazard = id_ex_valid && id_ex_mem_read && (id_ex_rd != 5'd0) &&
                              ((id_ex_rd == id_rs1) || (id_ex_rd == id_rs2));
 
     wire flush_id_ex = branch_mispredict_ex || load_use_hazard || take_trap || ex_is_mret;
@@ -457,6 +502,9 @@ module pipeline_cpu (
     reg        id_ex_is_sc;
     reg        id_ex_is_csr;
     reg        id_ex_is_mret;
+    reg        id_ex_is_ecall;
+    reg        id_ex_is_ebreak;
+    reg        id_ex_is_illegal;
     reg        id_ex_pred_taken;
     reg [31:0] id_ex_pred_target;
 
@@ -487,8 +535,12 @@ module pipeline_cpu (
             id_ex_is_sc         <= 1'b0;
             id_ex_is_csr        <= 1'b0;
             id_ex_is_mret       <= 1'b0;
+            id_ex_is_ecall      <= 1'b0;
+            id_ex_is_ebreak     <= 1'b0;
+            id_ex_is_illegal    <= 1'b0;
             id_ex_pred_taken    <= 1'b0;
             id_ex_pred_target   <= 32'h0000_0000;
+            id_ex_valid         <= 1'b0;
         end else if (dcache_stall) begin
             // Hold ID/EX state frozen during D-Cache miss
         end else if (flush_id_ex) begin
@@ -517,8 +569,12 @@ module pipeline_cpu (
             id_ex_is_sc         <= 1'b0;
             id_ex_is_csr        <= 1'b0;
             id_ex_is_mret       <= 1'b0;
+            id_ex_is_ecall      <= 1'b0;
+            id_ex_is_ebreak     <= 1'b0;
+            id_ex_is_illegal    <= 1'b0;
             id_ex_pred_taken    <= 1'b0;
             id_ex_pred_target   <= 32'h0000_0000;
+            id_ex_valid         <= 1'b0;
         end else if (!stall_m_ext) begin
             id_ex_pc            <= if_id_pc;
             id_ex_rs1_data      <= id_rs1_data;
@@ -545,8 +601,12 @@ module pipeline_cpu (
             id_ex_is_sc         <= id_is_sc;
             id_ex_is_csr        <= id_is_csr;
             id_ex_is_mret       <= id_is_mret;
+            id_ex_is_ecall      <= id_is_ecall;
+            id_ex_is_ebreak     <= id_is_ebreak;
+            id_ex_is_illegal    <= id_is_illegal;
             id_ex_pred_taken    <= if_id_pred_taken;
             id_ex_pred_target   <= if_id_pred_target;
+            id_ex_valid         <= if_id_valid;
         end
     end
 
@@ -555,6 +615,7 @@ module pipeline_cpu (
     //==========================================================================
     reg [4:0]  ex_mem_rd;
     reg        ex_mem_reg_write;
+    reg        ex_mem_valid;
     reg [31:0] ex_mem_alu_result;
 
     // Forwarding Unit Multiplexer Selects
@@ -562,17 +623,17 @@ module pipeline_cpu (
     reg [1:0] forward_b;
 
     always @(*) begin
-        if (ex_mem_reg_write && (ex_mem_rd != 5'd0) && (ex_mem_rd == id_ex_rs1)) begin
+        if (ex_mem_valid && ex_mem_reg_write && (ex_mem_rd != 5'd0) && (ex_mem_rd == id_ex_rs1)) begin
             forward_a = 2'b10; // Forward from EX/MEM stage
-        end else if (mem_wb_reg_write && (mem_wb_rd != 5'd0) && (mem_wb_rd == id_ex_rs1)) begin
+        end else if (mem_wb_valid && mem_wb_reg_write && (mem_wb_rd != 5'd0) && (mem_wb_rd == id_ex_rs1)) begin
             forward_a = 2'b01; // Forward from MEM/WB stage
         end else begin
             forward_a = 2'b00; // No forwarding
         end
 
-        if (ex_mem_reg_write && (ex_mem_rd != 5'd0) && (ex_mem_rd == id_ex_rs2)) begin
+        if (ex_mem_valid && ex_mem_reg_write && (ex_mem_rd != 5'd0) && (ex_mem_rd == id_ex_rs2)) begin
             forward_b = 2'b10; // Forward from EX/MEM stage
-        end else if (mem_wb_reg_write && (mem_wb_rd != 5'd0) && (mem_wb_rd == id_ex_rs2)) begin
+        end else if (mem_wb_valid && mem_wb_reg_write && (mem_wb_rd != 5'd0) && (mem_wb_rd == id_ex_rs2)) begin
             forward_b = 2'b01; // Forward from MEM/WB stage
         end else begin
             forward_b = 2'b00; // No forwarding
@@ -622,13 +683,13 @@ module pipeline_cpu (
         endcase
     end
 
-    assign branch_taken_ex  = (id_ex_is_branch && ex_branch_cond) || id_ex_is_jal || id_ex_is_jalr;
+    assign branch_taken_ex  = id_ex_valid && ((id_ex_is_branch && ex_branch_cond) || id_ex_is_jal || id_ex_is_jalr);
     assign branch_target_ex = id_ex_is_jalr ? ((fwd_val_a + id_ex_imm) & ~32'd1) :
                               (id_ex_pc + id_ex_imm);
 
     // Dynamic Branch Predictor Misprediction Evaluation
-    wire ex_is_ctrl = id_ex_is_branch || id_ex_is_jal || id_ex_is_jalr;
-    assign ex_is_jump = id_ex_is_jal || id_ex_is_jalr;
+    wire ex_is_ctrl = id_ex_valid && (id_ex_is_branch || id_ex_is_jal || id_ex_is_jalr);
+    assign ex_is_jump = id_ex_valid && (id_ex_is_jal || id_ex_is_jalr);
 
     // Branch Misprediction Occurred IF:
     //   1. Predicted Taken != Actual Taken
@@ -653,8 +714,8 @@ module pipeline_cpu (
     wire div_busy;
     wire [31:0] div_result;
 
-    wire mul_start = id_ex_is_mul && !mul_running && !mul_ready;
-    wire div_start = id_ex_is_div && !div_running && !div_ready;
+    wire mul_start = id_ex_valid && id_ex_is_mul && !mul_running && !mul_ready;
+    wire div_start = id_ex_valid && id_ex_is_div && !div_running && !div_ready;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -669,7 +730,7 @@ module pipeline_cpu (
         end
     end
 
-    assign stall_m_ext = (id_ex_is_mul && !mul_ready) || (id_ex_is_div && !div_ready);
+    assign stall_m_ext = id_ex_valid && ((id_ex_is_mul && !mul_ready) || (id_ex_is_div && !div_ready));
 
     multiplier u_multiplier (
         .clk    (clk),
@@ -698,20 +759,37 @@ module pipeline_cpu (
     // Privileged HPM CSR Block
     wire [31:0] ex_csr_rdata;
     wire [31:0] csr_operand = id_ex_funct3[2] ? {27'b0, id_ex_rs1} : fwd_val_a;
-    wire        csr_op_en   = id_ex_is_csr && !dcache_stall && !stall_m_ext && !branch_mispredict_ex && !take_trap && !ex_is_mret;
+    wire        csr_op_en   = id_ex_valid && id_ex_is_csr && !dcache_stall && !stall_m_ext && !branch_mispredict_ex && !take_trap && !ex_is_mret;
 
-    assign ex_is_mret = id_ex_is_mret && !dcache_stall && !stall_m_ext;
+    assign ex_is_mret = id_ex_valid && id_ex_is_mret && !dcache_stall && !stall_m_ext;
 
     wire        irq_pending;
     wire [31:0] mstatus_diag;
     wire [31:0] mcause_diag;
 
-    // Trap PC: save PC of the interrupted instruction (currently in ID/EX stage)
-    wire [31:0] trap_saved_pc = (id_ex_pc != 32'd0) ? id_ex_pc :
-                                (if_id_pc != 32'd0) ? if_id_pc : if_pc;
+    // Trap & Exception Handling
+    wire ex_has_exception = id_ex_valid && (id_ex_is_ecall || id_ex_is_ebreak || id_ex_is_illegal);
+    assign take_trap = (irq_pending || ex_has_exception) && !dcache_stall && !stall_m_ext;
 
-    // Trap triggered when interrupt is pending and pipeline is free of multi-cycle stalls
-    assign take_trap = irq_pending && !dcache_stall && !stall_m_ext && !branch_mispredict_ex && !ex_is_mret;
+    reg [31:0] trap_cause;
+    always @(*) begin
+        if (irq_pending) begin
+            trap_cause = 32'h8000_0007; // Machine Timer Interrupt
+        end else if (id_ex_is_illegal) begin
+            trap_cause = 32'h0000_0002; // Illegal Instruction
+        end else if (id_ex_is_ebreak) begin
+            trap_cause = 32'h0000_0003; // Breakpoint
+        end else if (id_ex_is_ecall) begin
+            trap_cause = 32'h0000_000B; // Environment Call from M-Mode
+        end else begin
+            trap_cause = 32'h8000_0007;
+        end
+    end
+
+    // Trap PC: save PC of the faulting/interrupted instruction
+    wire [31:0] trap_saved_pc = ex_has_exception ? id_ex_pc :
+                                (id_ex_valid && (id_ex_pc != 32'd0)) ? id_ex_pc :
+                                (if_id_valid && (if_id_pc != 32'd0)) ? if_id_pc : if_pc;
 
     hpm_csrs u_hpm_csrs (
         .clk              (clk),
@@ -721,15 +799,15 @@ module pipeline_cpu (
         .csr_addr         (id_ex_imm[11:0]),
         .csr_wdata        (csr_operand),
         .csr_rdata        (ex_csr_rdata),
-        .event_cycle      (rst_n && !dcache_stall && !stall_m_ext),
-        .event_instret    (mem_wb_reg_write || (mem_wb_pc != 32'd0)),
+        .event_cycle      (rst_n),                                  // Architectural mcycle counts all active clocks!
+        .event_instret    (mem_wb_valid && !dcache_stall),           // minstret counts ONLY true retired instructions!
         .event_branch     (ex_is_ctrl && !dcache_stall && !stall_m_ext),
         .event_mispredict (branch_mispredict_ex && !dcache_stall && !stall_m_ext),
         .timer_irq_in     (timer_irq_in),
         .irq_pending      (irq_pending),
         .trap_taken       (take_trap),
         .trap_pc          (trap_saved_pc),
-        .trap_cause       (32'h8000_0007),
+        .trap_cause       (trap_cause),
         .mret_exec        (ex_is_mret),
         .mtvec_out        (mtvec_target),
         .mepc_out         (mepc_target),
@@ -747,6 +825,7 @@ module pipeline_cpu (
     // EX/MEM Pipeline Register
     reg [31:0] ex_mem_pc;
     reg [31:0] ex_mem_store_data;
+    reg [2:0]  ex_mem_funct3;
     reg        ex_mem_mem_read;
     reg        ex_mem_mem_write;
     reg [2:0]  ex_mem_wb_sel;
@@ -759,6 +838,7 @@ module pipeline_cpu (
             ex_mem_pc         <= 32'h0000_0000;
             ex_mem_alu_result <= 32'h0000_0000;
             ex_mem_store_data <= 32'h0000_0000;
+            ex_mem_funct3     <= 3'd0;
             ex_mem_rd         <= 5'd0;
             ex_mem_reg_write  <= 1'b0;
             ex_mem_mem_read   <= 1'b0;
@@ -767,11 +847,13 @@ module pipeline_cpu (
             ex_mem_is_lr      <= 1'b0;
             ex_mem_is_sc      <= 1'b0;
             ex_mem_csr_rdata  <= 32'h0000_0000;
+            ex_mem_valid      <= 1'b0;
         end else if (take_trap) begin
-            // Trap flush: prevent interrupted instruction in ID/EX from executing/committing
+            // Trap flush: prevent interrupted/faulting instruction from committing
             ex_mem_pc         <= 32'h0000_0000;
             ex_mem_alu_result <= 32'h0000_0000;
             ex_mem_store_data <= 32'h0000_0000;
+            ex_mem_funct3     <= 3'd0;
             ex_mem_rd         <= 5'd0;
             ex_mem_reg_write  <= 1'b0;
             ex_mem_mem_read   <= 1'b0;
@@ -780,6 +862,7 @@ module pipeline_cpu (
             ex_mem_is_lr      <= 1'b0;
             ex_mem_is_sc      <= 1'b0;
             ex_mem_csr_rdata  <= 32'h0000_0000;
+            ex_mem_valid      <= 1'b0;
         end else if (dcache_stall) begin
             // Hold EX/MEM state frozen during D-Cache miss
         end else if (stall_m_ext) begin
@@ -789,10 +872,12 @@ module pipeline_cpu (
             ex_mem_mem_write  <= 1'b0;
             ex_mem_is_lr      <= 1'b0;
             ex_mem_is_sc      <= 1'b0;
+            ex_mem_valid      <= 1'b0;
         end else begin
             ex_mem_pc         <= id_ex_pc;
             ex_mem_alu_result <= ex_stage_result;
             ex_mem_store_data <= fwd_val_b;
+            ex_mem_funct3     <= id_ex_funct3;
             ex_mem_rd         <= id_ex_rd;
             ex_mem_reg_write  <= id_ex_reg_write;
             ex_mem_mem_read   <= id_ex_mem_read;
@@ -801,6 +886,7 @@ module pipeline_cpu (
             ex_mem_is_lr      <= id_ex_is_lr;
             ex_mem_is_sc      <= id_ex_is_sc;
             ex_mem_csr_rdata  <= ex_csr_rdata;
+            ex_mem_valid      <= id_ex_valid;
         end
     end
 
@@ -815,9 +901,9 @@ module pipeline_cpu (
     atomics u_atomics (
         .clk              (clk),
         .rst_n            (rst_n),
-        .is_lr            (ex_mem_is_lr),
-        .is_sc            (ex_mem_is_sc),
-        .is_store         (ex_mem_mem_write && !ex_mem_is_sc),
+        .is_lr            (ex_mem_valid && ex_mem_is_lr),
+        .is_sc            (ex_mem_valid && ex_mem_is_sc),
+        .is_store         (ex_mem_valid && ex_mem_mem_write && !ex_mem_is_sc),
         .mem_addr         (ex_mem_alu_result),
         .mem_wdata        (ex_mem_store_data),
         .effective_mem_we (effective_mem_we),
@@ -833,16 +919,47 @@ module pipeline_cpu (
         .sc_fail_count    ()
     );
 
+    // Byte write mask generation for SB, SH, SW
+    wire [1:0] mem_byte_offset = ex_mem_alu_result[1:0];
+    reg [3:0]  mem_wstrb;
+    reg [31:0] mem_aligned_wdata;
+
+    always @(*) begin
+        case (ex_mem_funct3)
+            3'b000: begin // SB (Store Byte)
+                case (mem_byte_offset)
+                    2'b00: begin mem_wstrb = 4'b0001; mem_aligned_wdata = {24'b0, ex_mem_store_data[7:0]}; end
+                    2'b01: begin mem_wstrb = 4'b0010; mem_aligned_wdata = {16'b0, ex_mem_store_data[7:0], 8'b0}; end
+                    2'b10: begin mem_wstrb = 4'b0100; mem_aligned_wdata = {8'b0, ex_mem_store_data[7:0], 16'b0}; end
+                    2'b11: begin mem_wstrb = 4'b1000; mem_aligned_wdata = {ex_mem_store_data[7:0], 24'b0}; end
+                endcase
+            end
+            3'b001: begin // SH (Store Halfword)
+                case (mem_byte_offset[1])
+                    1'b0: begin mem_wstrb = 4'b0011; mem_aligned_wdata = {16'b0, ex_mem_store_data[15:0]}; end
+                    1'b1: begin mem_wstrb = 4'b1100; mem_aligned_wdata = {ex_mem_store_data[15:0], 16'b0}; end
+                endcase
+            end
+            default: begin // SW (Store Word), SC.W
+                mem_wstrb         = 4'b1111;
+                mem_aligned_wdata = ex_mem_store_data;
+            end
+        endcase
+    end
+
     assign dmem_addr  = ex_mem_alu_result;
-    assign dmem_wdata = ex_mem_store_data;
-    assign dmem_we    = effective_mem_we;
-    assign dmem_re    = ex_mem_mem_read || effective_mem_re;
+    assign dmem_wdata = mem_aligned_wdata;
+    assign dmem_wstrb = mem_wstrb;
+    assign dmem_we    = ex_mem_valid && effective_mem_we;
+    assign dmem_re    = ex_mem_valid && (ex_mem_mem_read || effective_mem_re);
 
     assign trace_sc_success = sc_success;
 
     // MEM/WB Pipeline Register
+    reg [31:0] mem_wb_pc;
     reg [31:0] mem_wb_alu_result;
     reg [31:0] mem_wb_mem_rdata;
+    reg [2:0]  mem_wb_funct3;
     reg [2:0]  mem_wb_wb_sel;
     reg [31:0] mem_wb_sc_result;
     reg [31:0] mem_wb_csr_rdata;
@@ -852,30 +969,78 @@ module pipeline_cpu (
             mem_wb_pc         <= 32'h0000_0000;
             mem_wb_alu_result <= 32'h0000_0000;
             mem_wb_mem_rdata  <= 32'h0000_0000;
+            mem_wb_funct3     <= 3'd0;
             mem_wb_rd         <= 5'd0;
             mem_wb_reg_write  <= 1'b0;
             mem_wb_wb_sel     <= WB_ALU;
             mem_wb_sc_result  <= 32'h0000_0000;
             mem_wb_csr_rdata  <= 32'h0000_0000;
+            mem_wb_valid      <= 1'b0;
         end else if (dcache_stall) begin
             // Bubble MEM/WB stage during D-Cache miss
             mem_wb_reg_write  <= 1'b0;
+            mem_wb_valid      <= 1'b0;
         end else begin
             mem_wb_pc         <= ex_mem_pc;
             mem_wb_alu_result <= ex_mem_alu_result;
             mem_wb_mem_rdata  <= dmem_rdata;
+            mem_wb_funct3     <= ex_mem_funct3;
             mem_wb_rd         <= ex_mem_rd;
             mem_wb_reg_write  <= ex_mem_reg_write;
             mem_wb_wb_sel     <= ex_mem_wb_sel;
             mem_wb_sc_result  <= sc_result;
             mem_wb_csr_rdata  <= ex_mem_csr_rdata;
+            mem_wb_valid      <= ex_mem_valid;
         end
     end
 
     //==========================================================================
     // 5. WRITE-BACK (WB) STAGE
     //==========================================================================
-    assign wb_write_data = (mem_wb_wb_sel == WB_MEM) ? mem_wb_mem_rdata :
+    // Sub-word formatted load data for LB, LH, LW, LBU, LHU
+    wire [1:0] wb_byte_offset = mem_wb_alu_result[1:0];
+    reg [31:0] formatted_load_data;
+
+    always @(*) begin
+        case (mem_wb_funct3)
+            3'b000: begin // LB (Signed Byte)
+                case (wb_byte_offset)
+                    2'b00: formatted_load_data = {{24{mem_wb_mem_rdata[7]}},  mem_wb_mem_rdata[7:0]};
+                    2'b01: formatted_load_data = {{24{mem_wb_mem_rdata[15]}}, mem_wb_mem_rdata[15:8]};
+                    2'b10: formatted_load_data = {{24{mem_wb_mem_rdata[23]}}, mem_wb_mem_rdata[23:16]};
+                    2'b11: formatted_load_data = {{24{mem_wb_mem_rdata[31]}}, mem_wb_mem_rdata[31:24]};
+                endcase
+            end
+            3'b001: begin // LH (Signed Halfword)
+                case (wb_byte_offset[1])
+                    1'b0: formatted_load_data = {{16{mem_wb_mem_rdata[15]}}, mem_wb_mem_rdata[15:0]};
+                    1'b1: formatted_load_data = {{16{mem_wb_mem_rdata[31]}}, mem_wb_mem_rdata[31:16]};
+                endcase
+            end
+            3'b010: begin // LW (Word)
+                formatted_load_data = mem_wb_mem_rdata;
+            end
+            3'b100: begin // LBU (Unsigned Byte)
+                case (wb_byte_offset)
+                    2'b00: formatted_load_data = {24'b0, mem_wb_mem_rdata[7:0]};
+                    2'b01: formatted_load_data = {24'b0, mem_wb_mem_rdata[15:8]};
+                    2'b10: formatted_load_data = {24'b0, mem_wb_mem_rdata[23:16]};
+                    2'b11: formatted_load_data = {24'b0, mem_wb_mem_rdata[31:24]};
+                endcase
+            end
+            3'b101: begin // LHU (Unsigned Halfword)
+                case (wb_byte_offset[1])
+                    1'b0: formatted_load_data = {16'b0, mem_wb_mem_rdata[15:0]};
+                    1'b1: formatted_load_data = {16'b0, mem_wb_mem_rdata[31:16]};
+                endcase
+            end
+            default: begin
+                formatted_load_data = mem_wb_mem_rdata;
+            end
+        endcase
+    end
+
+    assign wb_write_data = (mem_wb_wb_sel == WB_MEM) ? formatted_load_data :
                            (mem_wb_wb_sel == WB_PC4) ? (mem_wb_pc + 32'd4) :
                            (mem_wb_wb_sel == WB_CSR) ? mem_wb_csr_rdata :
                            (mem_wb_wb_sel == WB_SC)  ? mem_wb_sc_result :
@@ -883,13 +1048,13 @@ module pipeline_cpu (
 
     // Diagnostic Tracing Outputs
     assign debug_if_pc        = if_pc;
-    assign debug_id_pc        = if_id_pc;
-    assign debug_ex_pc        = id_ex_pc;
-    assign debug_mem_pc       = ex_mem_pc;
-    assign debug_wb_pc        = mem_wb_pc;
+    assign debug_id_pc        = if_id_valid ? if_id_pc : 32'd0;
+    assign debug_ex_pc        = id_ex_valid ? id_ex_pc : 32'd0;
+    assign debug_mem_pc       = ex_mem_valid ? ex_mem_pc : 32'd0;
+    assign debug_wb_pc        = mem_wb_valid ? mem_wb_pc : 32'd0;
     assign debug_wb_data      = wb_write_data;
     assign debug_wb_rd        = mem_wb_rd;
-    assign debug_wb_reg_write = mem_wb_reg_write;
+    assign debug_wb_reg_write = regfile_we;
     assign debug_stall        = stall_pipeline;
     assign debug_flush        = branch_mispredict_ex || take_trap || ex_is_mret;
     assign trace_pred_taken   = pred_taken;

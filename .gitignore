@@ -1,4 +1,5 @@
-# Icarus Verilog Simulation Artifacts
+# Archives
+*.zip
 *.vcd
 *.log
 *_sim

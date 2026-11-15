@@ -1,7 +1,7 @@
 //==============================================================================
 // Module Name: dcache
 // Description: 1KB Direct-Mapped L1 Data Cache (D-Cache) with 16-Byte Lines,
-//              Multi-Cycle Burst Refill & Writeback for RV32I / RV32IM System-on-Chip.
+//              Byte-Masked Writes, Multi-Cycle Burst Refill & Writeback for RV32I / RV32IM System-on-Chip.
 //
 // Cache Specifications:
 //   - Total Capacity : 1024 Bytes (1 KB)
@@ -15,7 +15,8 @@
 //   - Write-Back     : Stores update the cache line and mark it dirty. Main
 //                      memory is written via 4-word burst when dirty line evicted.
 //   - Write-Allocate : On store miss, the 16-byte line is refilled into cache,
-//                      then updated with store data and marked dirty.
+//                      then updated with store data (masked by cpu_wstrb) and marked dirty.
+//   - Sub-Word Writes: cpu_wstrb[3:0] enables individual byte writes for SB, SH, SW.
 //   - MMIO Bypass    : Memory-mapped I/O (UART, CLINT) bypasses the cache directly.
 //
 // State Machine:
@@ -36,6 +37,7 @@ module dcache #(
     // CPU Memory Interface (MEM Stage of pipeline_cpu)
     input  wire [31:0] cpu_addr,
     input  wire [31:0] cpu_wdata,
+    input  wire [3:0]  cpu_wstrb,
     input  wire        cpu_mem_write,
     input  wire        cpu_mem_read,
     output wire [31:0] cpu_rdata,
@@ -45,6 +47,7 @@ module dcache #(
     // Main Memory / MMIO Bus Interface
     output reg  [31:0] mem_addr,
     output reg  [31:0] mem_wdata,
+    output reg  [3:0]  mem_wstrb,
     output reg         mem_write,
     output reg         mem_read,
     input  wire [31:0] mem_rdata,
@@ -103,6 +106,7 @@ module dcache #(
     // Latched request registers for multi-cycle miss servicing
     reg [31:0] req_addr;
     reg [31:0] req_wdata;
+    reg [3:0]  req_wstrb;
     reg        req_is_write;
     reg [1:0]  req_word_sel;
     reg [5:0]  req_index;
@@ -128,6 +132,7 @@ module dcache #(
             evict_count  <= 32'd0;
             req_addr     <= 32'd0;
             req_wdata    <= 32'd0;
+            req_wstrb    <= 4'd0;
             req_is_write <= 1'b0;
             req_word_sel <= 2'b00;
             req_index    <= 6'd0;
@@ -149,10 +154,30 @@ module dcache #(
                             hit_count <= hit_count + 32'd1;
                             if (cpu_mem_write) begin
                                 case (cpu_word_sel)
-                                    2'b00: data_w0[cpu_index] <= cpu_wdata;
-                                    2'b01: data_w1[cpu_index] <= cpu_wdata;
-                                    2'b10: data_w2[cpu_index] <= cpu_wdata;
-                                    2'b11: data_w3[cpu_index] <= cpu_wdata;
+                                    2'b00: begin
+                                        if (cpu_wstrb[0]) data_w0[cpu_index][7:0]   <= cpu_wdata[7:0];
+                                        if (cpu_wstrb[1]) data_w0[cpu_index][15:8]  <= cpu_wdata[15:8];
+                                        if (cpu_wstrb[2]) data_w0[cpu_index][23:16] <= cpu_wdata[23:16];
+                                        if (cpu_wstrb[3]) data_w0[cpu_index][31:24] <= cpu_wdata[31:24];
+                                    end
+                                    2'b01: begin
+                                        if (cpu_wstrb[0]) data_w1[cpu_index][7:0]   <= cpu_wdata[7:0];
+                                        if (cpu_wstrb[1]) data_w1[cpu_index][15:8]  <= cpu_wdata[15:8];
+                                        if (cpu_wstrb[2]) data_w1[cpu_index][23:16] <= cpu_wdata[23:16];
+                                        if (cpu_wstrb[3]) data_w1[cpu_index][31:24] <= cpu_wdata[31:24];
+                                    end
+                                    2'b10: begin
+                                        if (cpu_wstrb[0]) data_w2[cpu_index][7:0]   <= cpu_wdata[7:0];
+                                        if (cpu_wstrb[1]) data_w2[cpu_index][15:8]  <= cpu_wdata[15:8];
+                                        if (cpu_wstrb[2]) data_w2[cpu_index][23:16] <= cpu_wdata[23:16];
+                                        if (cpu_wstrb[3]) data_w2[cpu_index][31:24] <= cpu_wdata[31:24];
+                                    end
+                                    2'b11: begin
+                                        if (cpu_wstrb[0]) data_w3[cpu_index][7:0]   <= cpu_wdata[7:0];
+                                        if (cpu_wstrb[1]) data_w3[cpu_index][15:8]  <= cpu_wdata[15:8];
+                                        if (cpu_wstrb[2]) data_w3[cpu_index][23:16] <= cpu_wdata[23:16];
+                                        if (cpu_wstrb[3]) data_w3[cpu_index][31:24] <= cpu_wdata[31:24];
+                                    end
                                 endcase
                                 dirty_array[cpu_index] <= 1'b1;
                             end
@@ -161,6 +186,7 @@ module dcache #(
                             miss_count   <= miss_count + 32'd1;
                             req_addr     <= cpu_addr;
                             req_wdata    <= cpu_wdata;
+                            req_wstrb    <= cpu_wstrb;
                             req_is_write <= cpu_mem_write;
                             req_word_sel <= cpu_word_sel;
                             req_index    <= cpu_index;
@@ -214,16 +240,36 @@ module dcache #(
                             tag_array[req_index]   <= req_tag;
 
                             if (req_is_write) begin
-                                // Write-Allocate: update target word with CPU store data
+                                // Write-Allocate: update target word with CPU store data according to byte enables
                                 case (req_word_sel)
-                                    2'b00: data_w0[req_index] <= req_wdata;
-                                    2'b01: data_w1[req_index] <= req_wdata;
-                                    2'b10: data_w2[req_index] <= req_wdata;
-                                    2'b11: data_w3[req_index] <= req_wdata;
+                                    2'b00: begin
+                                        if (req_wstrb[0]) data_w0[req_index][7:0]   <= req_wdata[7:0];
+                                        if (req_wstrb[1]) data_w0[req_index][15:8]  <= req_wdata[15:8];
+                                        if (req_wstrb[2]) data_w0[req_index][23:16] <= req_wdata[23:16];
+                                        if (req_wstrb[3]) data_w0[req_index][31:24] <= req_wdata[31:24];
+                                        data_w3[req_index] <= mem_rdata;
+                                    end
+                                    2'b01: begin
+                                        if (req_wstrb[0]) data_w1[req_index][7:0]   <= req_wdata[7:0];
+                                        if (req_wstrb[1]) data_w1[req_index][15:8]  <= req_wdata[15:8];
+                                        if (req_wstrb[2]) data_w1[req_index][23:16] <= req_wdata[23:16];
+                                        if (req_wstrb[3]) data_w1[req_index][31:24] <= req_wdata[31:24];
+                                        data_w3[req_index] <= mem_rdata;
+                                    end
+                                    2'b10: begin
+                                        if (req_wstrb[0]) data_w2[req_index][7:0]   <= req_wdata[7:0];
+                                        if (req_wstrb[1]) data_w2[req_index][15:8]  <= req_wdata[15:8];
+                                        if (req_wstrb[2]) data_w2[req_index][23:16] <= req_wdata[23:16];
+                                        if (req_wstrb[3]) data_w2[req_index][31:24] <= req_wdata[31:24];
+                                        data_w3[req_index] <= mem_rdata;
+                                    end
+                                    2'b11: begin
+                                        data_w3[req_index][7:0]   <= req_wstrb[0] ? req_wdata[7:0]   : mem_rdata[7:0];
+                                        data_w3[req_index][15:8]  <= req_wstrb[1] ? req_wdata[15:8]  : mem_rdata[15:8];
+                                        data_w3[req_index][23:16] <= req_wstrb[2] ? req_wdata[23:16] : mem_rdata[23:16];
+                                        data_w3[req_index][31:24] <= req_wstrb[3] ? req_wdata[31:24] : mem_rdata[31:24];
+                                    end
                                 endcase
-                                if (req_word_sel != 2'b11) begin
-                                    data_w3[req_index] <= mem_rdata;
-                                end
                                 dirty_array[req_index] <= 1'b1;
                             end else begin
                                 data_w3[req_index]     <= mem_rdata;
@@ -250,6 +296,7 @@ module dcache #(
         case (state)
             STATE_WRITEBACK: begin
                 mem_addr  = {evict_tag, req_index, burst_idx, 2'b00};
+                mem_wstrb = 4'b1111;
                 mem_write = 1'b1;
                 mem_read  = 1'b0;
                 case (burst_idx)
@@ -263,6 +310,7 @@ module dcache #(
             STATE_REFILL: begin
                 mem_addr  = {req_tag, req_index, burst_idx, 2'b00};
                 mem_wdata = 32'h0000_0000;
+                mem_wstrb = 4'b0000;
                 mem_write = 1'b0;
                 mem_read  = 1'b1;
             end
@@ -272,11 +320,13 @@ module dcache #(
                     // Direct non-cacheable MMIO passthrough
                     mem_addr  = cpu_addr;
                     mem_wdata = cpu_wdata;
+                    mem_wstrb = cpu_wstrb;
                     mem_write = cpu_mem_write;
                     mem_read  = cpu_mem_read;
                 end else begin
                     mem_addr  = 32'h0000_0000;
                     mem_wdata = 32'h0000_0000;
+                    mem_wstrb = 4'b0000;
                     mem_write = 1'b0;
                     mem_read  = 1'b0;
                 end
@@ -285,6 +335,7 @@ module dcache #(
             default: begin
                 mem_addr  = 32'h0000_0000;
                 mem_wdata = 32'h0000_0000;
+                mem_wstrb = 4'b0000;
                 mem_write = 1'b0;
                 mem_read  = 1'b0;
             end

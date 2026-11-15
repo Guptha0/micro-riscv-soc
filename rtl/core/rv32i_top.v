@@ -70,11 +70,16 @@ module control_unit (
     localparam [6:0] OPCODE_AUIPC  = 7'b0010111; // 7'h17: auipc
 
     // ALU operation encodings matching alu.v
-    localparam [3:0] ALU_ADD = 4'b0000;
-    localparam [3:0] ALU_SUB = 4'b1000;
-    localparam [3:0] ALU_SLT = 4'b0010;
-    localparam [3:0] ALU_OR  = 4'b0110;
-    localparam [3:0] ALU_AND = 4'b0111;
+    localparam [3:0] ALU_ADD  = 4'b0000;
+    localparam [3:0] ALU_SUB  = 4'b1000;
+    localparam [3:0] ALU_SLL  = 4'b0001;
+    localparam [3:0] ALU_SLT  = 4'b0010;
+    localparam [3:0] ALU_SLTU = 4'b0011;
+    localparam [3:0] ALU_XOR  = 4'b0100;
+    localparam [3:0] ALU_SRL  = 4'b0101;
+    localparam [3:0] ALU_SRA  = 4'b1101;
+    localparam [3:0] ALU_OR   = 4'b0110;
+    localparam [3:0] ALU_AND  = 4'b0111;
 
     // Branch condition evaluation
     reg branch_cond_met;
@@ -107,7 +112,11 @@ module control_unit (
                 alu_src_b_sel = 1'b0; // rs2_data
                 case (funct3)
                     3'b000:  alu_ctrl = funct7[5] ? ALU_SUB : ALU_ADD;
+                    3'b001:  alu_ctrl = ALU_SLL;
                     3'b010:  alu_ctrl = ALU_SLT;
+                    3'b011:  alu_ctrl = ALU_SLTU;
+                    3'b100:  alu_ctrl = ALU_XOR;
+                    3'b101:  alu_ctrl = funct7[5] ? ALU_SRA : ALU_SRL;
                     3'b110:  alu_ctrl = ALU_OR;
                     3'b111:  alu_ctrl = ALU_AND;
                     default: alu_ctrl = ALU_ADD;
@@ -120,7 +129,11 @@ module control_unit (
                 alu_src_b_sel = 1'b1; // imm
                 case (funct3)
                     3'b000:  alu_ctrl = ALU_ADD; // ADDI
+                    3'b001:  alu_ctrl = ALU_SLL; // SLLI
                     3'b010:  alu_ctrl = ALU_SLT; // SLTI
+                    3'b011:  alu_ctrl = ALU_SLTU;// SLTIU
+                    3'b100:  alu_ctrl = ALU_XOR; // XORI
+                    3'b101:  alu_ctrl = funct7[5] ? ALU_SRA : ALU_SRL; // SRAI / SRLI
                     3'b110:  alu_ctrl = ALU_OR;  // ORI
                     3'b111:  alu_ctrl = ALU_AND; // ANDI
                     default: alu_ctrl = ALU_ADD;

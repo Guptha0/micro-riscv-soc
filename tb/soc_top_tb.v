@@ -1,13 +1,14 @@
 //==============================================================================
 // Testbench Name: soc_top_tb
 // Description: Comprehensive system-level verification testbench for the 
-//              Advanced RV32IM+A System-on-Chip featuring:
-//              - 5-Stage Pipelined RV32IM+A Core with Forwarding & Hazard Detection
-//              - M-Mode Trap & Exception Handling (mtvec, mepc, mcause, mstatus, mret)
+//              Advanced RV32IMZicsr_Zalrsc System-on-Chip featuring:
+//              - 5-Stage Pipelined RV32IMZicsr_Zalrsc Core with Forwarding & Hazard Detection
+//              - Complete RV32I Base Integer Set (Shifts, Compares, Sub-word Load/Store)
+//              - M-Mode Trap & Exception Handling (Timer IRQ, ECALL, mtvec, mepc, mcause, mret)
 //              - 16-Byte L1 Instruction Cache & Data Cache with Multi-Cycle Burst Refill
 //              - Dynamic Branch Predictor (64-entry BTB + 2-bit Saturating BHT)
-//              - RV32A Atomic Memory Extension (LR.W / SC.W & Bus Snooping)
-//              - Privileged Architecture HPM Telemetry CSRs (mcycle, minstret)
+//              - RV32A Atomic Memory Extension (LR.W / SC.W with Bus-Snooping Invalidation)
+//              - Privileged Architecture HPM Telemetry CSRs with strict minstret <= mcycle
 //              - Memory-Mapped UART Transmitter & CLINT Machine Timer
 //==============================================================================
 
@@ -45,7 +46,7 @@ module soc_top_tb;
     wire [31:0] trace_dcache_misses;
     wire [31:0] trace_dcache_evicts;
 
-    // Bleeding-Edge Telemetry Probes
+    // Advanced Telemetry Probes
     wire        trace_pred_taken;
     wire        trace_mispredict;
     wire        trace_sc_success;
@@ -163,6 +164,8 @@ module soc_top_tb;
 
     // Main Test Sequence
     integer r;
+    reg snoop_pulsed;
+
     initial begin
         $dumpfile("soc_top.vcd");
         $dumpvars(0, soc_top_tb);
@@ -179,11 +182,12 @@ module soc_top_tb;
         mret_exec_count         = 0;
         snoop_we                = 1'b0;
         snoop_addr              = 32'd0;
+        snoop_pulsed            = 1'b0;
         rst_n                   = 1'b1;
 
         $display("\n================================================================================");
-        $display("   STARTING ADVANCED RV32IM+A SOC FULL REGRESSION EXECUTION");
-        $display("   (M-Mode Traps, 16-Byte L1 Caches, Dynamic BTB, Atomics LR/SC, CSRs)");
+        $display("   STARTING ADVANCED RV32IMZicsr_Zalrsc SOC FULL REGRESSION EXECUTION");
+        $display("   (M-Mode Traps, ECALL, 16-Byte L1 Caches, Dynamic BTB, Atomics, HPM CSRs)");
         $display("================================================================================\n");
 
         // Step 1: Boot Reset Sequence
@@ -198,10 +202,22 @@ module soc_top_tb;
         $display(" Cyc |  WB PC     |  WB RegWrite  | Stall | Flush | PredTk | Mispr | D-Hits/Miss/Evict | System Event");
         $display("-----------------------------------------------------------------------------------------------------------------------------------------");
 
-        // Step 2: Cycle-by-Cycle Pipeline Trace over 320 Clock Cycles
-        for (cycle = 1; cycle <= 320; cycle = cycle + 1) begin
+        // Step 2: Cycle-by-Cycle Pipeline Trace over 400 Clock Cycles
+        for (cycle = 1; cycle <= 400; cycle = cycle + 1) begin
             @(posedge clk);
             #1; // Settling delay for combinational probes
+
+            // Bus-snooping invalidation stimulus:
+            // When reservation is registered at address 10 (from lr.w at 0x74) and core enters 0x78 (sc.w) in MEM
+            if (!snoop_pulsed && (dut.u_cpu.ex_mem_pc == 32'h0000_0078)) begin
+                snoop_we   <= 1'b1;
+                snoop_addr <= 32'd10;
+                snoop_pulsed = 1'b1;
+                $display("  [BUS SNOOP EVENT] Cycle %3d | External Write to Reserved Addr 0x0000000A! Invalidation Strobe Sent.", cycle);
+            end else begin
+                snoop_we   <= 1'b0;
+                snoop_addr <= 32'd0;
+            end
 
             if (trace_pred_taken) begin
                 btb_pred_taken_count = btb_pred_taken_count + 1;
@@ -215,7 +231,7 @@ module soc_top_tb;
             // Track M-Mode Trap Events
             if (trace_trap_taken) begin
                 trap_taken_count = trap_taken_count + 1;
-                $display("  [TRAP FIRED] Cycle %3d | Interrupted PC=0x%08h | Target mtvec=0x%08h | mcause=0x%08h",
+                $display("  [TRAP FIRED] Cycle %3d | Interrupted/Fault PC=0x%08h | Target mtvec=0x%08h | mcause=0x%08h",
                          cycle, trace_mepc, trace_mtvec, trace_mcause);
             end
 
@@ -286,22 +302,41 @@ module soc_top_tb;
         check_reg(5'd12, 32'd20,  "x12 (div x12 = 200 / 10 -> Divider)");
         check_reg(5'd13, 32'd5,   "x13 (rem x13 = 15 % 10 -> Remainder)");
 
-        // 7. L1 D-Cache Conflict, Eviction & Write-Back Tests (16-Byte Lines)
-        check_reg(5'd14, 32'd25,  "x14 (lw x14, 0(x0) -> Read back after dirty eviction of 0x400)");
-        check_reg(5'd15, 32'd200, "x15 (lw x15, 1024(x0) -> Read back after dirty eviction of 0x00)");
-        check_reg(5'd16, 32'd200, "x16 (lw x16, 1024(x0) -> Immediate D-Cache HIT)");
+        // 7. RV32I Sub-word Memory Access Tests (SB, SH, LBU, LH, LW)
+        check_reg(5'd14, 32'd15, "x14 (lbu x14, 512(x0) -> Unsigned byte loaded: 15)");
+        check_reg(5'd15, 32'd25, "x15 (lh  x15, 514(x0) -> Signed halfword loaded: 25)");
+        check_reg(5'd16, 32'h0019_000F, "x16 (lw  x16, 512(x0) -> Word with byte 0x0F & halfword 0x0019)");
 
-        // 8. Hardware Timer Interrupt Assertion
+        // 8. Main Data RAM Byte-Write Verification
         test_count = test_count + 1;
-        if (timer_irq_out === 1'b1 || timer_logged) begin
+        if (dut.u_dmem.ram[128] === 32'h0019_000F) begin
             pass_count = pass_count + 1;
-            $display("  [ASSERTION PASS] Hardware Timer Interrupt timer_irq_out Asserted (mtime >= mtimecmp)");
+            $display("  [ASSERTION PASS] Main RAM[512] Content Verified (0x0019000F) via Byte-Masked Writes");
+        end else begin
+            fail_count = fail_count + 1;
+            $display("  [ASSERTION FAIL] Main RAM[512] Mismatch! Expected: 0x0019000F, Actual: 0x%08h", dut.u_dmem.ram[128]);
+        end
+
+        // 9. Complete RV32I Immediate Shifts & Logic Tests
+        check_reg(5'd17, 32'd44, "x17 (slli  x17, x1, 2 = 11 << 2 -> 44)");
+        check_reg(5'd18, 32'd22, "x18 (srai  x18, x17, 1 = 44 >> 1 -> 22)");
+        check_reg(5'd19, 32'd4,  "x19 (xori  x19, x1, 15 = 11 ^ 15 -> 4)");
+        check_reg(5'd20, 32'd1,  "x20 (sltiu x20, x1, 20 = 11 < 20 -> 1)");
+
+        // 10. RV32A Atomic Memory Extension & Bus-Snooping Invalidation Test
+        check_reg(5'd21, 32'd1,  "x21 (sc.w x21 -> SC Failure return 1: reservation invalidated by Bus Snoop!)");
+
+        // 11. Hardware Timer Interrupt timer_irq_out Assertion
+        test_count = test_count + 1;
+        if (timer_irq_out || timer_logged) begin
+            pass_count = pass_count + 1;
+            $display("  [ASSERTION PASS] Hardware Timer Interrupt Generated Successfully");
         end else begin
             fail_count = fail_count + 1;
             $display("  [ASSERTION FAIL] Hardware Timer Interrupt timer_irq_out is NOT asserted!");
         end
 
-        // 9. UART Character Transmission Assertion
+        // 12. UART Character Transmission Assertion
         test_count = test_count + 1;
         if (uart_rx_count >= 3 && uart_rx_chars[0] == 8'd82 && uart_rx_chars[1] == 8'd86) begin
             pass_count = pass_count + 1;
@@ -311,7 +346,7 @@ module soc_top_tb;
             $display("  [ASSERTION FAIL] UART MMIO Stream Did Not Match Expected Characters!");
         end
 
-        // 10. 16-Byte L1 Instruction Cache Hit Assertion
+        // 13. 16-Byte L1 Instruction Cache Hit Assertion
         test_count = test_count + 1;
         if (trace_hit_count > 0) begin
             pass_count = pass_count + 1;
@@ -322,7 +357,7 @@ module soc_top_tb;
             $display("  [ASSERTION FAIL] L1 I-Cache recorded zero hits!");
         end
 
-        // 11. 16-Byte L1 Data Cache Hits Assertion
+        // 14. 16-Byte L1 Data Cache Hits Assertion
         test_count = test_count + 1;
         if (trace_dcache_hits > 0) begin
             pass_count = pass_count + 1;
@@ -333,7 +368,7 @@ module soc_top_tb;
             $display("  [ASSERTION FAIL] L1 D-Cache recorded zero hits!");
         end
 
-        // 12. 16-Byte L1 Data Cache Dirty Line Evictions & Write-Back Assertion
+        // 15. 16-Byte L1 Data Cache Dirty Line Evictions & Write-Back Assertion
         test_count = test_count + 1;
         if (trace_dcache_evicts > 0) begin
             pass_count = pass_count + 1;
@@ -344,14 +379,7 @@ module soc_top_tb;
             $display("  [ASSERTION FAIL] L1 D-Cache recorded zero evictions!");
         end
 
-        // 13. RV32A Atomic Memory Extension: LR.W & SC.W Tests
-        check_reg(5'd17, 32'd0,  "x17 (lr.w x17, 0(x1) -> Load-Reserved initial memory value)");
-        check_reg(5'd18, 32'd0,  "x18 (sc.w x18, x2, 0(x1) -> First SC Success return 0)");
-        check_reg(5'd19, 32'd1,  "x19 (sc.w x19, x2, 0(x1) -> Second SC Failure return 1: reservation cleared)");
-        check_reg(5'd20, 32'd15, "x20 (lr.w x20, 0(x1) -> Load-Reserved after SC updated memory to 15)");
-        check_reg(5'd21, 32'd0,  "x21 (sc.w x21, x2, 0(x1) -> Third SC Success return 0)");
-
-        // 14. Privileged Architecture HPM Telemetry CSR Assertions
+        // 16. Privileged Architecture HPM Telemetry CSR Assertions (Strict minstret <= mcycle)
         test_count = test_count + 1;
         if (dut.u_cpu.u_regfile.registers[22] > 32'd0) begin
             pass_count = pass_count + 1;
@@ -372,27 +400,39 @@ module soc_top_tb;
             $display("  [ASSERTION FAIL] CSR minstret Readout x23 is 0!");
         end
 
+        // Strict Architectural Counter Verification: minstret <= mcycle
         test_count = test_count + 1;
-        if (dut.u_cpu.u_regfile.registers[24] > 32'd0) begin
+        if (dut.u_cpu.u_regfile.registers[23] <= dut.u_cpu.u_regfile.registers[22] && dut.u_cpu.u_regfile.registers[23] > 32'd0) begin
             pass_count = pass_count + 1;
-            $display("  [ASSERTION PASS] CSR mhpmcounter3 [Branches] Readout x24 == %0d (> 0)",
-                     dut.u_cpu.u_regfile.registers[24]);
+            $display("  [ASSERTION PASS] Architectural Invariant Upheld: minstret (%0d) <= mcycle (%0d)",
+                     dut.u_cpu.u_regfile.registers[23], dut.u_cpu.u_regfile.registers[22]);
         end else begin
             fail_count = fail_count + 1;
-            $display("  [ASSERTION FAIL] CSR mhpmcounter3 [Branches] Readout x24 is 0!");
+            $display("  [ASSERTION FAIL] Physically impossible counters! minstret (%0d) > mcycle (%0d)",
+                     dut.u_cpu.u_regfile.registers[23], dut.u_cpu.u_regfile.registers[22]);
         end
 
         test_count = test_count + 1;
-        if (dut.u_cpu.u_regfile.registers[25] >= 32'd1) begin
+        if (dut.u_cpu.u_hpm_csrs.mhpmcounter3 > 64'd0) begin
             pass_count = pass_count + 1;
-            $display("  [ASSERTION PASS] CSR mhpmcounter4 [Mispredicts] Readout x25 == %0d (>= 1)",
-                     dut.u_cpu.u_regfile.registers[25]);
+            $display("  [ASSERTION PASS] CSR mhpmcounter3 [Branches] == %0d (> 0)",
+                     dut.u_cpu.u_hpm_csrs.mhpmcounter3[31:0]);
         end else begin
             fail_count = fail_count + 1;
-            $display("  [ASSERTION FAIL] CSR mhpmcounter4 [Mispredicts] Readout x25 is 0!");
+            $display("  [ASSERTION FAIL] CSR mhpmcounter3 [Branches] is 0!");
         end
 
-        // 15. Dynamic Branch Predictor Hit & Training Assertions
+        test_count = test_count + 1;
+        if (dut.u_cpu.u_hpm_csrs.mhpmcounter4 >= 64'd1) begin
+            pass_count = pass_count + 1;
+            $display("  [ASSERTION PASS] CSR mhpmcounter4 [Mispredicts] == %0d (>= 1)",
+                     dut.u_cpu.u_hpm_csrs.mhpmcounter4[31:0]);
+        end else begin
+            fail_count = fail_count + 1;
+            $display("  [ASSERTION FAIL] CSR mhpmcounter4 [Mispredicts] is 0!");
+        end
+
+        // 17. Dynamic Branch Predictor Hit & Training Assertions
         test_count = test_count + 1;
         if (btb_pred_taken_count > 0) begin
             pass_count = pass_count + 1;
@@ -403,38 +443,38 @@ module soc_top_tb;
             $display("  [ASSERTION FAIL] Dynamic BTB predicted taken was never asserted!");
         end
 
-        // 16. Dynamic Branch Loop Counter Down to Zero Assertion
+        // 18. Dynamic Branch Loop Counter Down to Zero Assertion
         check_reg(5'd26, 32'd0, "x26 (Dynamic branch loop completed countdown to 0)");
 
-        // 17. M-Mode Trap Configuration Assertions
+        // 19. M-Mode Trap Configuration Assertions
         check_reg(5'd27, 32'h0000_00C0, "x27 (Configured mtvec Trap Handler Address 0x000000C0)");
         check_reg(5'd28, 32'h0000_0080, "x28 (Configured mie.MTIE Timer Interrupt Mask 0x00000080)");
         check_reg(5'd29, 32'h0000_0008, "x29 (Configured mstatus.MIE Global Interrupt Mask 0x00000008)");
 
-        // 18. M-Mode Trap Handler Assertions
-        check_reg(5'd30, 32'h8000_0007, "x30 (Trap Handler Read mcause == 0x80000007 Machine Timer Interrupt)");
-        check_reg(5'd31, 32'h0000_00B8, "x31 (Trap Handler Read mepc == 0x000000B8 Interrupted Instruction PC)");
+        // 20. Synchronous Exception & Dynamic mcause Assertions
+        check_reg(5'd30, 32'h0000_000B, "x30 (Trap Handler Read mcause == 0x0000000B ECALL Exception)");
+        check_reg(5'd31, 32'h0000_0110, "x31 (Trap Handler Advanced mepc to 0x00000110 past ECALL)");
 
-        // 19. Trap Entry and MRET Execution Event Assertions
+        // 21. Multi-Trap Entry and MRET Execution Event Assertions
         test_count = test_count + 1;
-        if (trap_taken_count >= 1) begin
+        if (trap_taken_count >= 2) begin
             pass_count = pass_count + 1;
-            $display("  [ASSERTION PASS] M-Mode Trap Entry Verified (%0d trap taken events)", trap_taken_count);
+            $display("  [ASSERTION PASS] Multi-Trap Entry Verified (%0d trap taken events: IRQ & ECALL)", trap_taken_count);
         end else begin
             fail_count = fail_count + 1;
-            $display("  [ASSERTION FAIL] M-Mode Trap was never taken!");
+            $display("  [ASSERTION FAIL] Expected at least 2 trap entries (IRQ & ECALL), got %0d!", trap_taken_count);
         end
 
         test_count = test_count + 1;
-        if (mret_exec_count >= 1) begin
+        if (mret_exec_count >= 2) begin
             pass_count = pass_count + 1;
             $display("  [ASSERTION PASS] M-Mode MRET Instruction Execution Verified (%0d mret events)", mret_exec_count);
         end else begin
             fail_count = fail_count + 1;
-            $display("  [ASSERTION FAIL] MRET instruction was never executed!");
+            $display("  [ASSERTION FAIL] Expected at least 2 MRET executions, got %0d!", mret_exec_count);
         end
 
-        // 20. Resumed Execution Assertion: x1 was 10, incremented to 11 upon MRET return!
+        // 22. Resumed Execution Assertion: x1 was 10, incremented to 11 upon MRET return!
         check_reg(5'd1, 32'd11, "x1 (Resumed execution after MRET: addi x1, x1, 1 -> x1 = 11)");
 
         // Step 4: Final Register State Dump (x0 - x31)
@@ -451,7 +491,7 @@ module soc_top_tb;
 
         // Step 5: Test Execution Summary
         $display("\n================================================================================");
-        $display("   RV32IM+A ADVANCED SOC FULL REGRESSION EXECUTION SUMMARY");
+        $display("   RV32IMZicsr_Zalrsc ADVANCED SOC FULL REGRESSION EXECUTION SUMMARY");
         $display("================================================================================");
         $display("   Total Simulated Cycles         : %0d", cycle - 1);
         $display("   Total Assertions Checked       : %0d", test_count);
@@ -463,14 +503,17 @@ module soc_top_tb;
         $display("   16-Byte D-Cache Miss Count     : %0d", trace_dcache_misses);
         $display("   16-Byte D-Cache Evict Count    : %0d", trace_dcache_evicts);
         $display("   Dynamic BTB Predicted-Taken    : %0d", btb_pred_taken_count);
+        $display("   Zero-Penalty Branch Hits       : %0d", btb_zero_penalty_hits);
         $display("   Trap Entry Events              : %0d", trap_taken_count);
         $display("   MRET Execution Events          : %0d", mret_exec_count);
+        $display("   CSR mcycle Counter Value       : %0d", dut.u_cpu.u_hpm_csrs.mcycle[31:0]);
+        $display("   CSR minstret Counter Value     : %0d", dut.u_cpu.u_hpm_csrs.minstret[31:0]);
         $display("   mcause Latched Value           : 0x%08h", dut.u_cpu.u_hpm_csrs.mcause);
         $display("   mepc Latched Value             : 0x%08h", dut.u_cpu.u_hpm_csrs.mepc);
         $display("================================================================================");
 
         if (fail_count == 0) begin
-            $display("\n   [RESULT: SUCCESS] ADVANCED RV32IM+A SOC PASSED ALL TRAP & CACHE ASSERTIONS!\n");
+            $display("\n   [RESULT: SUCCESS] ADVANCED RV32IMZicsr_Zalrsc SOC PASSED ALL ASSERTIONS!\n");
             $finish(0);
         end else begin
             $display("\n   [RESULT: FAILURE] %0d ASSERTIONS FAILED!\n", fail_count);

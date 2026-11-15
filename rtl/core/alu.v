@@ -18,7 +18,12 @@ module alu #(
     // Standard RISC-V RV32I ALU operation encodings {funct7[5], funct3}
     parameter [3:0] ALU_ADD  = 4'b0000, // funct7[5]=0, funct3=000
     parameter [3:0] ALU_SUB  = 4'b1000, // funct7[5]=1, funct3=000
+    parameter [3:0] ALU_SLL  = 4'b0001, // funct7[5]=0, funct3=001
     parameter [3:0] ALU_SLT  = 4'b0010, // funct7[5]=0, funct3=010
+    parameter [3:0] ALU_SLTU = 4'b0011, // funct7[5]=0, funct3=011
+    parameter [3:0] ALU_XOR  = 4'b0100, // funct7[5]=0, funct3=100
+    parameter [3:0] ALU_SRL  = 4'b0101, // funct7[5]=0, funct3=101
+    parameter [3:0] ALU_SRA  = 4'b1101, // funct7[5]=1, funct3=101
     parameter [3:0] ALU_OR   = 4'b0110, // funct7[5]=0, funct3=110
     parameter [3:0] ALU_AND  = 4'b0111  // funct7[5]=0, funct3=111
 )(
@@ -75,13 +80,38 @@ module alu #(
                 overflow = add_ovf;
             end
 
-            ALU_SUB, 4'b0001: begin // Standard RISC-V 4'b1000 and alias 4'b0001
+            ALU_SUB: begin
                 result   = sub_res;
                 overflow = sub_ovf;
             end
 
-            ALU_AND: begin
-                result   = a & b;
+            ALU_SLL: begin
+                result   = a << b[4:0];
+                overflow = 1'b0;
+            end
+
+            ALU_SLT: begin
+                result   = {31'b0, slt_val};
+                overflow = 1'b0;
+            end
+
+            ALU_SLTU: begin
+                result   = {31'b0, (a < b)};
+                overflow = 1'b0;
+            end
+
+            ALU_XOR: begin
+                result   = a ^ b;
+                overflow = 1'b0;
+            end
+
+            ALU_SRL: begin
+                result   = a >> b[4:0];
+                overflow = 1'b0;
+            end
+
+            ALU_SRA: begin
+                result   = $signed(a) >>> b[4:0];
                 overflow = 1'b0;
             end
 
@@ -90,8 +120,8 @@ module alu #(
                 overflow = 1'b0;
             end
 
-            ALU_SLT: begin
-                result   = {31'b0, slt_val};
+            ALU_AND: begin
+                result   = a & b;
                 overflow = 1'b0;
             end
 

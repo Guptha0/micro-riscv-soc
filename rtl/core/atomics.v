@@ -56,7 +56,7 @@ module atomics (
     wire snoop_matches       = reservation_valid && snoop_we && (reservation_addr == snoop_word_addr);
 
     // Output assignments
-    assign sc_success = is_sc && reservation_matches;
+    assign sc_success = is_sc && reservation_matches && !snoop_matches;
     assign sc_result  = sc_success ? 32'd0 : 32'd1;
 
     // SC writes to memory ONLY if reservation is valid and matches
