@@ -1,0 +1,23 @@
+name: CPU Verification
+
+on: [push, pull_request]
+
+jobs:
+  simulate-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout CPU Code
+        uses: actions/checkout@v4
+
+      - name: Install Open-Source EDA Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog verilator yosys
+
+      - name: Lint All Verilog Files
+        run: verilator --lint-only -Wall -Irtl/core -Irtl/memory -Irtl/peripherals -Irtl/soc rtl/soc/soc_top.v
+
+      - name: Run All Testbenches
+        run: |
+          chmod +x run_all.sh scripts/*.sh
+          ./run_all.sh
