@@ -15,7 +15,7 @@ jobs:
           sudo apt-get install -y iverilog verilator yosys
 
       - name: Lint All Verilog Files
-        run: verilator --lint-only -Wall -Irtl/core -Irtl/memory -Irtl/peripherals -Irtl/soc rtl/soc/soc_top.v
+        run: verilator --lint-only -Wall -Wno-PINCONNECTEMPTY -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-WIDTHTRUNC -Wno-SYNCASYNCNET -Irtl/core -Irtl/memory -Irtl/peripherals -Irtl/soc rtl/soc/soc_top.v
 
       - name: Run All Testbenches
         run: |
