@@ -1,0 +1,62 @@
+[*]
+[*] GTKWave Analyzer Save File for RV32IM+A SoC
+[*]
+[dumpfile] "/mnt/f/my_cpu/sim/waves/soc_top.vcd"
+[savefile] "/mnt/f/my_cpu/sim/waves/soc_top.gtkw"
+[timestart] 0
+[size] 1600 900
+[pos] -1 -1
+*-18.000000 200000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+[treeopen] soc_top_tb.
+[treeopen] soc_top_tb.dut.
+[treeopen] soc_top_tb.dut.u_cpu.
+@28
+soc_top_tb.clk
+soc_top_tb.rst_n
+@22
+soc_top_tb.cycle[31:0]
+@200
+-PIPELINE WB COMMIT & TRACE
+@22
+soc_top_tb.trace_pc[31:0]
+soc_top_tb.trace_wb_rd[4:0]
+soc_top_tb.trace_wb_data[31:0]
+@28
+soc_top_tb.trace_wb_we
+soc_top_tb.trace_stall
+soc_top_tb.trace_flush
+@200
+-BRANCH PREDICTOR & SPECULATION
+@28
+soc_top_tb.trace_pred_taken
+soc_top_tb.trace_mispredict
+@200
+-RV32A ATOMICS (LR/SC)
+@28
+soc_top_tb.trace_sc_success
+@22
+soc_top_tb.dut.u_cpu.u_atomics.cpu_word_addr[29:0]
+soc_top_tb.dut.u_cpu.u_atomics.reservation_addr[29:0]
+@28
+soc_top_tb.dut.u_cpu.u_atomics.reservation_valid
+@200
+-PRIVILEGED HPM CSR TELEMETRY
+@22
+soc_top_tb.trace_csr_mcycle[63:0]
+soc_top_tb.trace_csr_minstret[63:0]
+@200
+-L1 CACHES & MEMORY
+@28
+soc_top_tb.trace_cache_hit
+soc_top_tb.trace_dcache_hit
+@22
+soc_top_tb.trace_dcache_hits[31:0]
+soc_top_tb.trace_dcache_misses[31:0]
+soc_top_tb.trace_dcache_evicts[31:0]
+@200
+-PERIPHERALS (TIMER & UART)
+@28
+soc_top_tb.timer_irq_out
+soc_top_tb.uart_tx_pin
+[pattern_trace] 1
+[pattern_trace] 0

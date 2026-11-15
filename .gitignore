@@ -1,0 +1,11 @@
+# Icarus Verilog Simulation Artifacts
+*.vcd
+*.log
+*_sim
+sim/bin/*
+sim/waves/*
+sim/logs/*
+!sim/bin/.gitkeep
+!sim/waves/.gitkeep
+!sim/logs/.gitkeep
+!sim/waves/*.gtkw

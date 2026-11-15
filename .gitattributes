@@ -1,0 +1,9 @@
+# Set default behavior to use LF line endings
+* text=auto eol=lf
+
+# Force bash scripts and Makefile to always use LF
+*.sh text eol=lf
+Makefile text eol=lf
+*.v text eol=lf
+*.gtkw text eol=lf
+*.md text eol=lf
